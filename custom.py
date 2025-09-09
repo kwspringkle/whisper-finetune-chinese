@@ -407,9 +407,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return metrics
         
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """
-        Bước dự đoán tùy chỉnh để xử lý attention_mask đúng cách cho việc sinh
-        """
         # Đảm bảo tất cả token IDs là integers
         self._ensure_integer_token_ids(model)
         
