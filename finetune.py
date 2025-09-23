@@ -18,17 +18,16 @@ from transformers import (
     WhisperForConditionalGeneration,
     Seq2SeqTrainingArguments,
 )
+from tqdm import tqdm
 from transformers.trainer_callback import EarlyStoppingCallback
-from .utils import(
+from utils import(
     clean_text,
     is_valid,
     apply_local_timestamps,
-    preprocess_dataset,
     config_tokenizer,
-    delete_all_checkpoints
+    backup_and_delete_all_checkpoints,
 )
-
-from .custom import(
+from custom import(
     MemoryCleanupCallback,
     decode_with_timestamps,
     CustomEvalCallback,
@@ -54,33 +53,16 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
         # Đệm nhãn với padding bên phải (right padding)
-        label_features = [{"input_ids": feature["labels"][:self.max_label_length]} for feature in features]
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
         labels_batch = self.processor.tokenizer.pad(
             label_features, 
             return_tensors="pt",
-            max_length=self.max_label_length, 
-            padding="max_length",  
-            pad_to_multiple_of=None
         )
-
-        labels = labels_batch["input_ids"].clone()
-        attention_mask = labels_batch["attention_mask"]
-
-        # Xác định timestamp tokens
-        timestamp_token_ids = []
-        for token, token_id in self.processor.tokenizer.get_vocab().items():
-            if token.startswith("<|") and token.endswith("|>") and any(c.isdigit() for c in token):
-                timestamp_token_ids.append(int(token_id))
-
-        # Giữ tất cả non-padding tokens
-        keep_mask = attention_mask.bool()
         
         # Áp dụng mask
-        labels = labels.masked_fill(~keep_mask, -100)
-        if self.processor.tokenizer.pad_token_id is not None:
-            labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        
-        batch["attention_mask"] = attention_mask
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        labels[labels == self.processor.tokenizer.pad_token_id] = -100
+
         batch["labels"] = labels
         
         return batch
@@ -99,12 +81,11 @@ def compute_metrics(pred):
     label_ids = pred.label_ids
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
-    pred_str = decode_with_timestamps(processor, pred_ids, skip_special_tokens=True)
-    label_str = decode_with_timestamps(processor, label_ids, skip_special_tokens=True)
+    pred_str = decode_with_timestamps(processor,pred_ids, skip_special_tokens=True)
+    label_str = decode_with_timestamps(processor,label_ids, skip_special_tokens=True)
 
     pred_clean = [clean_text(s) for s in pred_str]
     label_clean = [clean_text(s) for s in label_str]
-
     for i in range(min(3, len(pred_str))):
         print(f"\n=== Sample {i+1} ===")
         print(f"Pred ids:   {pred_ids[i]}")
@@ -116,9 +97,7 @@ def compute_metrics(pred):
         print("-" * 50)
 
     cer = metric.compute(predictions=pred_clean, references=label_clean) * 100
-    return {"cer": cer,
-           "predictions": pred_str,
-            "labels": label_str}
+    return {"cer": cer}
 
 # --- Hàm huấn luyện chính ---         
 def train(
@@ -139,31 +118,33 @@ def train(
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        gradient_accumulation_steps=8,
+        per_device_eval_batch_size=8,
+        gradient_accumulation_steps=1,
         eval_accumulation_steps=4,
         learning_rate=learning_rate,
         num_train_epochs=num_epoch,
         eval_strategy="epoch" if eval_dataset else "no",
         save_strategy="epoch",
-        logging_steps=10,
+        logging_steps=50,
         remove_unused_columns=False,
         label_names=["labels"],
-        load_best_model_at_end=bool(eval_dataset),
+        load_best_model_at_end=True,
         metric_for_best_model="cer" if eval_dataset else None,
         greater_is_better=False,
         fp16=True,
         fp16_full_eval=True,
         save_total_limit=1,
-        lr_scheduler_type="reduce_lr_on_plateau",
-        warmup_ratio=0.05,
+        lr_scheduler_type="linear",  
+        warmup_ratio=0.1,  
         push_to_hub=True,
-        hub_model_id="kwspringkles/whisper-medium-finetuned",
-        max_grad_norm=1.0,
-        weight_decay=0.01,
+        hub_model_id="kwspringkles/whisper-medium-finetuned-10epochs",
+        max_grad_norm=1.0, 
+        weight_decay=0.01,  
         predict_with_generate=True,
         generation_max_length=445,
         generation_num_beams=1,
+        hub_strategy="end",
+        dataloader_pin_memory=True,
     )
     trainer = CustomSeq2SeqTrainer(
         model=model,
@@ -173,9 +154,10 @@ def train(
         data_collator=data_collator,
         tokenizer=processor,
         compute_metrics=compute_metrics,
-        callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=3), 
-            MemoryCleanupCallback()],
+    callbacks=[
+        EarlyStoppingCallback(early_stopping_patience=3),  # Giảm từ 3 xuống 2
+        MemoryCleanupCallback(),
+    ],
     )
     trainer.add_callback(CustomEvalCallback(trainer=trainer, processor=processor, metric=metric))
 
@@ -188,7 +170,7 @@ def train(
     trainer.save_model()
     processor.save_pretrained(output_dir)
 
-    delete_all_checkpoints(output_dir)
+    # backup_and_delete_all_checkpoints(output_dir, "./backup")
     print(f"\n✅ Model saved to: {output_dir}")
     trainer.push_to_hub()
     return trainer
@@ -218,32 +200,24 @@ processor = WhisperProcessor.from_pretrained(
 # --- Cấu hình Model ---
 
 print("Configuring model...")
-model.config.dropout = 0.2
-model.config.attention_dropout = 0.2
-model.config.activation_dropout = 0.2
+model.config.dropout = 0.1
 
 # Đảm bảo tất cả config IDs là integers
 model.config.pad_token_id = int(model.config.pad_token_id or 50257)
 model.config.eos_token_id = int(model.config.eos_token_id or 50257)
 model.config.decoder_start_token_id = int(model.config.decoder_start_token_id or 50257)
-
-forced_decoder_ids = [
-    (1, 50260),  # Start of transcript
-    (2, 50359),  # Chinese language token
-]
-model.generation_config.forced_decoder_ids = forced_decoder_ids
-
 model.generation_config.return_timestamps = True
 model.generation_config.language = "zh"
 model.generation_config.task = "transcribe"
+forced_decoder_ids = processor.get_decoder_prompt_ids(language="chinese", task="transcribe", no_timestamps=False)
+model.config.forced_decoder_ids = forced_decoder_ids
 # Đảm bảo tất cả token IDs trong generation config là integers
 model.generation_config.pad_token_id = int(model.config.pad_token_id)
 model.generation_config.eos_token_id = int(model.config.eos_token_id)
 model.generation_config.decoder_start_token_id = int(model.config.decoder_start_token_id)
-# Xử lý suppress_tokens
-if hasattr(model.generation_config, 'suppress_tokens'):
-    suppress_tokens = model.generation_config.suppress_tokens or []
-    model.generation_config.suppress_tokens = []
+# # Xử lý suppress_tokens
+# model.config.suppress_tokens = []
+# model.generation_config.suppress_tokens = []
 
 print("=== DEBUG TOKEN IDS ===")
 print("Model config eos_token_id:", model.config.eos_token_id, type(model.config.eos_token_id))
@@ -251,20 +225,7 @@ print("Model config pad_token_id:", model.config.pad_token_id, type(model.config
 print("Generation config eos_token_id:", model.generation_config.eos_token_id, type(model.generation_config.eos_token_id))
 print("Generation config pad_token_id:", model.generation_config.pad_token_id, type(model.generation_config.pad_token_id))
 print("Forced decoder IDs:", forced_decoder_ids)
-
-# --- Thêm Token mới ---
-
-print("Adding new pad token to vocabulary...")
-new_pad_token = "<|pad|>"
-processor.tokenizer.add_tokens([new_pad_token])
-new_pad_token_id = processor.tokenizer.convert_tokens_to_ids(new_pad_token)
-
-# Resize model embeddings và cập nhật pad_token_id
-model.resize_token_embeddings(len(processor.tokenizer))
-model.config.pad_token_id = new_pad_token_id
-model.generation_config.pad_token_id = new_pad_token_id
-
-print(f"New pad token: '{new_pad_token}' -> ID: {new_pad_token_id}")
+model.generation_config.pad_token_id = model.config.pad_token_id
 print(model.generation_config.pad_token_id)
 
 print("Configuring tokenizer...")
@@ -282,26 +243,54 @@ dataset = load_dataset("kwspringkles/film_final")
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16000, decode=True))
 dataset = dataset.filter(is_valid, num_proc=16)
 
-os.makedirs("./whisper-chinese-timestamp", exist_ok=True)
-os.makedirs("./results", exist_ok=True)
 print("Preprocessing dataset...")
 dataset = dataset.map(apply_local_timestamps, num_proc=16)
-
-train_ds = dataset["train"]
-val_ds = dataset.get("validation", None)
-test_ds = dataset.get("test", None)
-
-train_dataset = preprocess_dataset(train_ds, processor, batch_size=64)
-val_dataset = preprocess_dataset(val_ds, processor, batch_size=64)
-test_dataset = preprocess_dataset(test_ds, processor, batch_size=64)
+os.makedirs("./whisper-chinese-timestamp", exist_ok=True)
+os.makedirs("./results", exist_ok=True)
 
 
+def prepare_dataset(batch):
+    audio = batch["audio"]
+    text = batch["chinese_local"]
+    batch["input_features"] = processor.feature_extractor(
+        audio["array"], sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+    batch["labels"] = processor.tokenizer(text,truncation=True,padding=False, max_length=448).input_ids
+    return {"input_features": batch["input_features"], "labels": batch["labels"]}
+
+dataset = dataset.map(
+    prepare_dataset,
+    num_proc=16,  
+    load_from_cache_file=True,  
+    desc="Preprocessing audio and text" 
+)
+
+train_dataset = dataset["train"]
+val_dataset = dataset["validation"]
+test_dataset = dataset["test"]
 # Clean up memory
 del dataset
 # del train_ds
 # del val_ds
 gc.collect()
 torch.cuda.empty_cache()
+
+
+# --- Kiểm tra Data Collator với mẫu dữ liệu thực ---
+
+print("\n=== Kiểm tra Data Collator ===")
+
+# Lấy 3 mẫu đầu từ train_dataset
+sample_features = [train_dataset[i] for i in range(min(3, len(train_dataset)))]
+
+
+
+# Áp dụng data collator
+batch = data_collator(sample_features)
+
+
+print("=== Chi tiết Labels (một phần) ===")
+print(f"Labels tensor (first 10 tokens per sample):\n{batch['labels']}")
 
 # --- Bắt đầu Huấn luyện ---
 
@@ -312,8 +301,11 @@ trainer = train(
     train_dataset,
     val_dataset,
     output_dir="./whisper-chinese-timestamp",
-    num_epoch=15,
+    num_epoch=10,
     batch_size=8,
-    learning_rate=3e-6,
+    learning_rate=5e-6,  
     metric=metric,
 )
+
+results = trainer.evaluate(eval_dataset=test_dataset)
+print(f"\n✅ Test results: {results}")

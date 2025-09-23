@@ -11,7 +11,7 @@ from transformers import (
     Seq2SeqTrainer,
     TrainerCallback,
 )
-from .utils import clean_text
+from utils import clean_text
 
 # --- Hàm giải mã tùy chỉnh --- 
 def decode_with_timestamps(
@@ -73,8 +73,6 @@ class MemoryCleanupCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, **kwargs):
         torch.cuda.empty_cache()
         gc.collect()
-
-
 
 # --- Custom Evaluation Callback ---
 class CustomEvalCallback(TrainerCallback):
@@ -230,8 +228,8 @@ class CustomEvalCallback(TrainerCallback):
                 # Log first few samples for debugging
                 if i < 3:
                     tqdm.write(f"   Sample {i+1}:")
-                    tqdm.write(f"     GT: {ground_truth_with_timestamps[:100]}...")
-                    tqdm.write(f"     Pred: {predicted_with_timestamps[:100]}...")
+                    tqdm.write(f"     GT: {ground_truth_with_timestamps[:200]}...")
+                    tqdm.write(f"     Pred: {predicted_with_timestamps[:200]}...")
                     tqdm.write(f"     CER: {individual_cer:.2f}%")
             
             # Save to Excel
@@ -323,11 +321,11 @@ class CustomEvalCallback(TrainerCallback):
             tqdm.write("\n🔍 TRAINING SET EVALUATION")
             tqdm.write("-" * 40)
             
-            # subset_size = min(len(self.trainer.train_dataset), 1000)
-            # tqdm.write(f"   Using subset of {subset_size} training samples")
+            subset_size = min(len(self.trainer.train_dataset), 100)
+            tqdm.write(f"   Using subset of {subset_size} training samples")
             
-            # train_subset = self.trainer.train_dataset.select(range(subset_size))
-            train_subset = self.trainer.train_dataset
+            train_subset = self.trainer.train_dataset.select(range(subset_size))
+            # train_subset = self.trainer.train_dataset
             train_cer, train_results = self.run_detailed_evaluation(
                 train_subset, 
                 "training", 
@@ -363,48 +361,113 @@ class CustomEvalCallback(TrainerCallback):
         gc.collect()
         tqdm.write("🧹 Memory cleanup completed")
 
-# --- Custom Trainer ---
-class CustomSeq2SeqTrainer(Seq2SeqTrainer): 
-    def create_scheduler(self, num_training_steps: int, optimizer=None):
-        optimizer_to_use = self.optimizer if hasattr(self, 'optimizer') else optimizer
-        
-        from torch.optim.lr_scheduler import ReduceLROnPlateau
-        
-        # Tạo scheduler nhưng chưa set threshold cụ thể
-        self.lr_scheduler = ReduceLROnPlateau(
-            optimizer_to_use,
-            mode="min",
-            factor=0.5,
-            patience=1,
-            threshold=1e-4, 
-            min_lr=1e-7
-        )
-        
-        # Lưu lại để điều chỉnh sau
-        self.scheduler_optimizer = optimizer_to_use
-        print("🔍 Config scheduler")
-        return self.lr_scheduler
+class CustomSeq2SeqTrainer(Seq2SeqTrainer):   
+    # def compute_loss(self, model, inputs, return_outputs=False,num_items_in_batch=None):
+    #     # Tính loss gốc
+    #     self.model_accepts_loss_kwargs=False
+    #     outputs = model(**inputs)
+    #     loss = outputs.loss
 
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        print("🔍 Custom evaluate method called")
-        metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-        print("📊 Metrics returned:", metrics)
+    #     # Tính penalty cho prediction ngắn - áp dụng cả training và eval
+    #     if self.args.predict_with_generate and model.training:
+    #         try:
+    #             # Chỉ áp dụng penalty 10% các step để tránh quá chậm
+    #             if torch.rand(1).item() < 0.2:
+    #                 # Sinh prediction
+    #                 generated_ids = model.generate(
+    #                     inputs["input_features"],
+    #                     attention_mask=inputs.get("attention_mask", None),
+    #                     max_length=self.args.generation_max_length,
+    #                     num_beams=1,
+    #                     forced_decoder_ids=model.generation_config.forced_decoder_ids,
+    #                     suppress_tokens=[],  # Không suppress EOS để cho phép dừng
+    #                 )
+                    
+    #                 # Độ dài prediction và label
+    #                 pred_lens = (generated_ids != model.config.pad_token_id).sum(dim=1).float()
+    #                 label_lens = (inputs["labels"] != -100).sum(dim=1).float()
+                    
+    #                 # Tính tỷ lệ độ dài
+    #                 length_ratio = pred_lens / label_lens.clamp(min=1.0)
+                    
+    #                 # Phạt nặng nếu prediction quá ngắn (< 0.5 độ dài label)
+    #                 short_penalty = torch.where(
+    #                     length_ratio < 0.5,
+    #                     (0.5 - length_ratio) * 10.0,  # Phạt nặng
+    #                     torch.zeros_like(length_ratio)
+    #                 ).mean()
+                    
+    #                 # Phạt nhẹ nếu prediction hơi ngắn (0.5-0.8 độ dài label)
+    #                 medium_penalty = torch.where(
+    #                     (length_ratio >= 0.5) & (length_ratio < 0.8),
+    #                     (0.8 - length_ratio) * 2.0,  # Phạt nhẹ
+    #                     torch.zeros_like(length_ratio)
+    #                 ).mean()
+
+    #                 long_penalty = torch.where(
+    #                     length_ratio >= 1.1,
+    #                     (length_ratio-1.1) * 2.0,  # Phạt nhẹ
+    #                     torch.zeros_like(length_ratio)
+    #                 ).mean()
+
+    #                 very_long_penalty = torch.where(
+    #                     length_ratio >= 1.5,
+    #                     (length_ratio-1.5) * 10.0,  # Phạt nặng
+    #                     torch.zeros_like(length_ratio)
+    #                 ).mean()
+                    
+                    
+    #                 # Tổng penalty
+    #                 penalty = short_penalty + medium_penalty + long_penalty + very_long_penalty
+    #                 loss = loss + penalty
+                    
+    #         except Exception:
+    #             # Nếu generate lỗi, không phạt
+    #             pass
+
+    #     if return_outputs:
+    #         return loss, outputs
+    #     return loss
+    # def create_scheduler(self, num_training_steps: int, optimizer=None):
+    #     optimizer_to_use = self.optimizer if hasattr(self, 'optimizer') else optimizer
         
-        # ĐIỀU CHỈNH THRESHOLD THEO METRIC
-        if "eval_cer" in metrics:
-            # Dùng threshold lớn cho CER
-            self.lr_scheduler.threshold = 0.005
-            self.lr_scheduler.threshold_mode = 'abs'
-            print(f"📉 Scheduler step with CER: {metrics['eval_cer']:.4f}, threshold: 0.005")
-            self.lr_scheduler.step(metrics["eval_cer"])
-        else:
-            # Dùng threshold nhỏ cho Loss
-            self.lr_scheduler.threshold = 1e-4
-            self.lr_scheduler.threshold_mode = 'rel'
-            print(f"📉 Scheduler step with Loss: {metrics['eval_loss']:.4f}, threshold: 1e-4")
-            self.lr_scheduler.step(metrics["eval_loss"])
+    #     from torch.optim.lr_scheduler import ReduceLROnPlateau
         
-        return metrics
+    #     # Tạo scheduler nhưng chưa set threshold cụ thể
+    #     self.lr_scheduler = ReduceLROnPlateau(
+    #         optimizer_to_use,
+    #         mode="min",
+    #         factor=0.5,
+    #         patience=1,
+    #         threshold=1e-4, 
+    #         min_lr=1e-7
+    #     )
+        
+    #     # Lưu lại để điều chỉnh sau
+    #     self.scheduler_optimizer = optimizer_to_use
+    #     print("🔍 Config scheduler")
+    #     return self.lr_scheduler
+
+    # def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+    #     print("🔍 Custom evaluate method called")
+    #     metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+    #     print("📊 Metrics returned:", metrics)
+        
+    #     # ĐIỀU CHỈNH THRESHOLD THEO METRIC
+    #     if "eval_cer" in metrics:
+    #         # Dùng threshold lớn cho CER
+    #         self.lr_scheduler.threshold = 0.005
+    #         self.lr_scheduler.threshold_mode = 'abs'
+    #         print(f"📉 Scheduler step with CER: {metrics['eval_cer']:.4f}, threshold: 0.005")
+    #         self.lr_scheduler.step(metrics["eval_cer"])
+    #     else:
+    #         # Dùng threshold nhỏ cho Loss
+    #         self.lr_scheduler.threshold = 1e-4
+    #         self.lr_scheduler.threshold_mode = 'rel'
+    #         print(f"📉 Scheduler step with Loss: {metrics['eval_loss']:.4f}, threshold: 1e-4")
+    #         self.lr_scheduler.step(metrics["eval_loss"])
+        
+    #     return metrics
         
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         # Đảm bảo tất cả token IDs là integers
