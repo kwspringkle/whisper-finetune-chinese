@@ -8,7 +8,6 @@ from multiprocessing import Pool
 import torch
 import evaluate
 import numpy as np
-import pandas as pd
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from huggingface_hub import login
@@ -34,8 +33,41 @@ from custom import(
     CustomSeq2SeqTrainer
 )
 
-# --- Config môi trường ---
+from lora_config import wrap_with_lora
 
+def simple_model_check(model, base_model_name="openai/whisper-medium", check_name="Model"):
+    """
+    Simple check để xem model có thay đổi so với base không
+    """
+    try:
+        base_model = WhisperForConditionalGeneration.from_pretrained(base_model_name)
+        
+        # Check 1 layer quan trọng
+        layer_name = "model.encoder.layers.0.self_attn.q_proj.weight"
+        
+        model_weight = dict(model.named_parameters())[layer_name]
+        base_weight = dict(base_model.named_parameters())[layer_name]
+        
+        diff = torch.abs(model_weight - base_weight)
+        max_diff = torch.max(diff).item()
+        
+        print(f"🔍 {check_name}: max diff = {max_diff:.2e}", end="")
+        
+        if max_diff > 1e-6:
+            print(" ✅ CHANGED")
+            return True
+        else:
+            print(" ❌ SAME as base")
+            return False
+            
+    except Exception as e:
+        print(f"🔍 {check_name}: ❌ Error - {e}")
+        return False
+    finally:
+        if 'base_model' in locals():
+            del base_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+# --- Config môi trường ---
 load_dotenv()
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["WANDB_DISABLED"] = os.getenv("WANDB_DISABLED", "true")
@@ -111,6 +143,7 @@ def train(
     batch_size=4,
     learning_rate=1e-5,
     metric=evaluate.load("cer"),
+    base_model_name="openai/whisper-medium",  # Thêm parameter này
 ):
     """
     Hàm huấn luyện chính cho mô hình Whisper.
@@ -118,9 +151,9 @@ def train(
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=8,
-        gradient_accumulation_steps=1,
-        eval_accumulation_steps=4,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=2,
+        eval_accumulation_steps=2,
         learning_rate=learning_rate,
         num_train_epochs=num_epoch,
         eval_strategy="epoch" if eval_dataset else "no",
@@ -137,7 +170,7 @@ def train(
         lr_scheduler_type="linear",  
         warmup_ratio=0.1,  
         push_to_hub=True,
-        hub_model_id="kwspringkles/whisper-medium-finetuned-10epochs",
+        hub_model_id="kwspringkles/whisper-medium-new",
         max_grad_norm=1.0, 
         weight_decay=0.01,  
         predict_with_generate=True,
@@ -167,12 +200,42 @@ def train(
         print(f"Total eval samples: {len(eval_dataset)}")
     trainer._ensure_integer_token_ids(model)
     trainer.train()
-    trainer.save_model()
+    
+    # Merge LoRA weights vào base model để tạo model hoàn chỉnh
+    print("� Merging LoRA weights into base model...")
+    merged_model = model.merge_and_unload()
+    
+    # Lưu model hoàn chỉnh (như Whisper bình thường)
+    print("💾 Saving merged model...")
+    merged_model.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
-
+    
+    # Backup LoRA adapter riêng (optional)
+    lora_backup_dir = output_dir + "_lora_adapter"
+    print(f"💾 Backing up LoRA adapter to: {lora_backup_dir}")
+    model.save_pretrained(lora_backup_dir)  # Chỉ LoRA weights
+    
     # backup_and_delete_all_checkpoints(output_dir, "./backup")
-    print(f"\n✅ Model saved to: {output_dir}")
-    trainer.push_to_hub()
+    print(f"\n✅ Complete Whisper model saved to: {output_dir}")
+    print(f"✅ LoRA adapter backup saved to: {lora_backup_dir}")
+    print("📁 Model can be loaded with: WhisperForConditionalGeneration.from_pretrained()")
+    
+    # Simple verification trước khi push
+    print("\n� Pre-push verification:")
+    test_model = WhisperForConditionalGeneration.from_pretrained(output_dir)
+    simple_model_check(test_model, base_model_name, "Final Model")
+    del test_model
+    
+    # Push model hoàn chỉnh lên Hub (như Whisper bình thường)
+    try:
+        print("🚀 Pushing complete Whisper model to Hub...")
+        merged_model.push_to_hub("kwspringkles/whisper-medium-new")
+        processor.push_to_hub("kwspringkles/whisper-medium-new")
+        print("✅ Complete Whisper model pushed to Hub successfully!")
+        print("📱 Can be used with: pipeline('automatic-speech-recognition', model='your-username/whisper-medium-chinese-finetune')")
+    except Exception as e:
+        print(f"⚠️ Failed to push to Hub: {e}")
+    
     return trainer
         
 # ===================================================================
@@ -192,7 +255,19 @@ print(f"Using device: {device}")
 # --- Khởi tạo Model và Processor ---
 
 print("Initializing model...")
-model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
+
+# Load base model trước
+base_model = WhisperForConditionalGeneration.from_pretrained(model_name)
+
+# Apply LoRA
+print("🔄 Applying LoRA configuration...")
+model = wrap_with_lora(base_model)
+
+# Simple check
+print("� Initial model vs base:", end=" ")
+simple_model_check(model, model_name, "Initial LoRA")
+
+model = model.to(device)
 processor = WhisperProcessor.from_pretrained(
     model_name, language="chinese", task="transcribe"
 )
@@ -200,7 +275,7 @@ processor = WhisperProcessor.from_pretrained(
 # --- Cấu hình Model ---
 
 print("Configuring model...")
-model.config.dropout = 0.1
+model.config.dropout = 0.0
 
 # Đảm bảo tất cả config IDs là integers
 model.config.pad_token_id = int(model.config.pad_token_id or 50257)
@@ -302,10 +377,8 @@ trainer = train(
     val_dataset,
     output_dir="./whisper-chinese-timestamp",
     num_epoch=10,
-    batch_size=8,
-    learning_rate=5e-6,  
+    batch_size=4,
+    learning_rate=1e-5,  
     metric=metric,
+    base_model_name=model_name,  # Thêm parameter này
 )
-
-results = trainer.evaluate(eval_dataset=test_dataset)
-print(f"\n✅ Test results: {results}")
